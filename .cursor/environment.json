@@ -1,0 +1,4 @@
+{
+  "name": "BcNamedPipe (C++/CMake)",
+  "install": "CC=gcc CXX=g++ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j"
+}
