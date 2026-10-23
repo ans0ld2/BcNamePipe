@@ -43,21 +43,60 @@ void storeLength(char* data, std::uint32_t len)
     raw[3] = static_cast<unsigned char>((len >> 24) & 0xffu);
 }
 
-int pollFd(int fd, short events)
+int waitFor(int fd, short events, std::chrono::steady_clock::time_point deadline)
 {
-    pollfd pfd{};
-    pfd.fd = fd;
-    pfd.events = events;
     for (;;) {
-        const int pr = ::poll(&pfd, 1, -1);
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return ETIMEDOUT;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        int waitMs = 0;
+        if (remaining.count() > 0) {
+            waitMs = remaining.count() > 600000 ? 600000 : static_cast<int>(remaining.count());
+        }
+
+        pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = events;
+        const int pr = ::poll(&pfd, 1, waitMs);
         if (pr < 0) {
             if (errno == EINTR) {
                 continue;
             }
             return errno;
         }
+        if (pr == 0) {
+            continue;
+        }
         return 0;
     }
+}
+
+int writeAll(int fd, const char* data, std::size_t size, std::chrono::steady_clock::time_point deadline)
+{
+    std::size_t written = 0;
+    while (written < size) {
+        const ssize_t n = ::write(fd, data + written, size - written);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                const int pr = waitFor(fd, POLLOUT, deadline);
+                if (pr != 0) {
+                    return pr;
+                }
+                continue;
+            }
+            return errno;
+        }
+        if (n == 0) {
+            return EPIPE;
+        }
+        written += static_cast<std::size_t>(n);
+    }
+    return 0;
 }
 
 } // namespace
@@ -187,38 +226,13 @@ int BcNamedPipe::open(std::chrono::milliseconds timeout)
     }
 }
 
-int BcNamedPipe::writeAll(const char* data, std::size_t size)
-{
-    std::size_t written = 0;
-    while (written < size) {
-        const ssize_t n = ::write(fd, data + written, size - written);
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                const int pr = pollFd(fd, POLLOUT);
-                if (pr != 0) {
-                    return pr;
-                }
-                continue;
-            }
-            return errno;
-        }
-        if (n == 0) {
-            return EPIPE;
-        }
-        written += static_cast<std::size_t>(n);
-    }
-    return 0;
-}
-
-BcNamedPipe::Result BcNamedPipe::readData()
+BcNamedPipe::Result BcNamedPipe::readData(std::chrono::milliseconds timeout)
 {
     if (mode != Mode::Reader || fd < 0) {
         return Result{EBADF, {}};
     }
 
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     for (;;) {
         if (buffer.size() >= kFrameHeader) {
             const std::uint32_t len = loadLength(buffer.data());
@@ -252,7 +266,7 @@ BcNamedPipe::Result BcNamedPipe::readData()
                 continue;
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                const int pr = pollFd(fd, POLLIN);
+                const int pr = waitFor(fd, POLLIN, deadline);
                 if (pr != 0) {
                     return Result{pr, {}};
                 }
@@ -268,7 +282,7 @@ BcNamedPipe::Result BcNamedPipe::readData()
     }
 }
 
-BcNamedPipe::Result BcNamedPipe::writeData(const std::string& data)
+BcNamedPipe::Result BcNamedPipe::writeData(const std::string& data, std::chrono::milliseconds timeout)
 {
     if (mode != Mode::Writer || fd < 0) {
         return Result{EBADF, {}};
@@ -279,15 +293,16 @@ BcNamedPipe::Result BcNamedPipe::writeData(const std::string& data)
         return Result{EMSGSIZE, {}};
     }
 
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     char header[kFrameHeader];
     storeLength(header, static_cast<std::uint32_t>(data.size()));
 
-    const int headerError = writeAll(header, kFrameHeader);
+    const int headerError = writeAll(fd, header, kFrameHeader, deadline);
     if (headerError != 0) {
         return Result{headerError, {}};
     }
     if (!data.empty()) {
-        const int payloadError = writeAll(data.data(), data.size());
+        const int payloadError = writeAll(fd, data.data(), data.size(), deadline);
         if (payloadError != 0) {
             return Result{payloadError, {}};
         }

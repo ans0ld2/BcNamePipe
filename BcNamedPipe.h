@@ -45,12 +45,13 @@ public:
     // reader appears or timeout elapses. Returns 0 or an errno value.
     int open(std::chrono::milliseconds timeout);
 
-    Result readData();
-    Result writeData(const std::string& data);
+    // Wait at most timeout for one full frame, or for the peer to accept
+    // the frame. ETIMEDOUT leaves the descriptor open.
+    Result readData(std::chrono::milliseconds timeout);
+    Result writeData(const std::string& data, std::chrono::milliseconds timeout);
     void setInternalBuffer(std::size_t bufSize);
 
 private:
-    int writeAll(const char* data, std::size_t size);
 
     std::string fifoPath;
     Mode mode;

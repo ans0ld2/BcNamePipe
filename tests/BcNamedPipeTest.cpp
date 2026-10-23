@@ -86,9 +86,9 @@ int testRoundTrip()
             const int writerOpen = writer.open(std::chrono::seconds(2));
             if (writerOpen != 0) {
                 code = 2;
-            } else if (writer.writeData(withNul).error != 0) {
+            } else if (writer.writeData(withNul, std::chrono::seconds(2)).error != 0) {
                 code = 3;
-            } else if (writer.writeData(longer).error != 0) {
+            } else if (writer.writeData(longer, std::chrono::seconds(2)).error != 0) {
                 code = 4;
             }
         }
@@ -106,8 +106,8 @@ int testRoundTrip()
         return fail("writer child failed: " + std::to_string(code));
     }
 
-    const Bc::BcNamedPipe::Result gotNul = reader.readData();
-    const Bc::BcNamedPipe::Result gotLong = reader.readData();
+    const Bc::BcNamedPipe::Result gotNul = reader.readData(std::chrono::seconds(2));
+    const Bc::BcNamedPipe::Result gotLong = reader.readData(std::chrono::seconds(2));
     ::alarm(0);
 
     if (gotNul.error != 0) {
@@ -165,6 +165,151 @@ int testOpenTimeout()
     return 0;
 }
 
+int testReadTimeout()
+{
+    const std::string path = "/tmp/bc-named-pipe-rd-" + std::to_string(::getpid());
+    ::unlink(path.c_str());
+
+    int ready[2] = {-1, -1};
+    int release[2] = {-1, -1};
+    if (::pipe(ready) != 0 || ::pipe(release) != 0) {
+        return fail("pipe failed");
+    }
+
+    Bc::BcNamedPipe reader(path, Bc::BcNamedPipe::Mode::Reader);
+    reader.setInternalBuffer(4096);
+    ::alarm(10);
+    if (reader.open(std::chrono::milliseconds(0)) != 0) {
+        ::alarm(0);
+        return fail("read-timeout reader open failed");
+    }
+
+    const std::string withNul = nulMessage();
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        ::alarm(0);
+        return fail("read-timeout fork failed");
+    }
+    if (pid == 0) {
+        ::alarm(10);
+        ::close(ready[0]);
+        ::close(release[1]);
+        int code = 0;
+        {
+            Bc::BcNamedPipe writer(path, Bc::BcNamedPipe::Mode::Writer);
+            writer.setInternalBuffer(4096);
+            if (writer.open(std::chrono::seconds(2)) != 0) {
+                code = 2;
+            } else if (::write(ready[1], "R", 1) != 1) {
+                code = 3;
+            } else {
+                char go = 0;
+                if (::read(release[0], &go, 1) != 1) {
+                    code = 4;
+                } else if (writer.writeData(withNul, std::chrono::seconds(2)).error != 0) {
+                    code = 5;
+                }
+            }
+        }
+        _exit(code);
+    }
+
+    ::close(ready[1]);
+    ::close(release[0]);
+
+    char opened = 0;
+    if (::read(ready[0], &opened, 1) != 1) {
+        ::alarm(0);
+        return fail("writer did not stay open");
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    const Bc::BcNamedPipe::Result timedOut = reader.readData(std::chrono::milliseconds(250));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    if (::write(release[1], "G", 1) != 1) {
+        ::alarm(0);
+        return fail("failed to release writer");
+    }
+
+    const Bc::BcNamedPipe::Result got = reader.readData(std::chrono::seconds(2));
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) {
+        ::alarm(0);
+        return fail("read-timeout waitpid failed");
+    }
+    ::alarm(0);
+
+    if (timedOut.error != ETIMEDOUT) {
+        return fail("readData did not time out: " + std::to_string(timedOut.error));
+    }
+    if (elapsed < std::chrono::milliseconds(200) || elapsed >= std::chrono::seconds(3)) {
+        return fail("readData timeout duration was unexpected");
+    }
+    if (childStatus(status) != 0) {
+        return fail("read-timeout writer failed: " + std::to_string(childStatus(status)));
+    }
+    if (got.error != 0 || got.bytes != withNul) {
+        return fail("fd was not usable after read timeout");
+    }
+    return 0;
+}
+
+int testWriteTimeout()
+{
+    const std::string path = "/tmp/bc-named-pipe-wr-" + std::to_string(::getpid());
+    ::unlink(path.c_str());
+
+    Bc::BcNamedPipe reader(path, Bc::BcNamedPipe::Mode::Reader);
+    ::alarm(10);
+    if (reader.open(std::chrono::milliseconds(0)) != 0) {
+        ::alarm(0);
+        return fail("write-timeout reader open failed");
+    }
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        ::alarm(0);
+        return fail("write-timeout fork failed");
+    }
+    if (pid == 0) {
+        ::alarm(10);
+        int code = 1;
+        {
+            Bc::BcNamedPipe writer(path, Bc::BcNamedPipe::Mode::Writer);
+            writer.setInternalBuffer(Bc::BcNamedPipe::kMaxBuffer);
+            if (writer.open(std::chrono::seconds(2)) != 0) {
+                code = 2;
+            } else {
+                const std::string bulk(Bc::BcNamedPipe::kMaxBuffer - 4, 'Z');
+                const auto started = std::chrono::steady_clock::now();
+                const Bc::BcNamedPipe::Result blocked = writer.writeData(bulk, std::chrono::milliseconds(250));
+                const auto elapsed = std::chrono::steady_clock::now() - started;
+                const Bc::BcNamedPipe::Result again = writer.writeData(std::string("x"), std::chrono::milliseconds(50));
+                if (blocked.error == ETIMEDOUT
+                    && again.error == ETIMEDOUT
+                    && elapsed >= std::chrono::milliseconds(200)
+                    && elapsed < std::chrono::seconds(3)) {
+                    code = 0;
+                }
+            }
+        }
+        _exit(code);
+    }
+
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) {
+        ::alarm(0);
+        return fail("write-timeout waitpid failed");
+    }
+    ::alarm(0);
+
+    const int code = childStatus(status);
+    if (code != 0) {
+        return fail("writeData did not time out while the peer never read: " + std::to_string(code));
+    }
+    return 0;
+}
+
 } // namespace
 
 int main()
@@ -175,6 +320,12 @@ int main()
     static_assert(std::is_move_assignable<Bc::BcNamedPipe>::value, "move assign");
 
     if (const int rc = testOpenTimeout()) {
+        return rc;
+    }
+    if (const int rc = testReadTimeout()) {
+        return rc;
+    }
+    if (const int rc = testWriteTimeout()) {
         return rc;
     }
     if (const int rc = testRoundTrip()) {
