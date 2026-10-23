@@ -19,6 +19,10 @@ namespace Bc {
  * The constructor stores the path and mode and creates the FIFO with mode
  * 0600. It does not open the descriptor. Only the instance that created the
  * name unlinks it. One reader and one writer. Several writers mix frames.
+ *
+ * If a frame is torn on write, torn on read, or rejected with EMSGSIZE, that
+ * error sticks. Later readData and writeData return it and transfer no more
+ * bytes. Close both ends.
  */
 class BcNamedPipe {
 public:
@@ -30,15 +34,17 @@ public:
     /**
      * @brief Bytes transferred and the error code for one read or write.
      *
-     * error == 0 is one full frame. error == kPeerClosed is peer close or EOF.
-     * A positive error is errno, including ETIMEDOUT.
+     * error == 0 is one full frame, which may be empty. error == kPeerClosed
+     * means the peer closed in the middle of a frame; that value then sticks.
+     * A positive error is errno, including ETIMEDOUT and EMSGSIZE. EMSGSIZE
+     * and a timeout or I/O error after a partial frame also stick.
      */
     struct Result {
         int error = 0;
         std::string bytes;
     };
 
-    /** @brief Peer closed the FIFO, or read returned EOF. Not an errno value. */
+    /** @brief Peer closed mid-frame. Not an errno value. Sticky once returned. */
     static constexpr int kPeerClosed = -1;
     /** @brief Upper bound for the internal frame buffer, in bytes. */
     static constexpr std::size_t kMaxBuffer = 1024 * 1024;
@@ -94,33 +100,35 @@ public:
 
     /**
      * @brief Read one little-endian length-prefixed frame.
-     * @param timeout Maximum wait for a full frame.
-     * @return Result with the payload on success, kPeerClosed on EOF, or errno. ETIMEDOUT leaves the descriptor open.
+     * @param timeout Maximum wait for a full frame, including while no writer is open.
+     * @return Result with the payload on success. EOF with nothing buffered waits out the timeout and returns ETIMEDOUT. EOF mid-frame returns sticky kPeerClosed. EMSGSIZE sticks. The descriptor stays open.
      */
     Result readData(std::chrono::milliseconds timeout);
 
     /**
      * @brief Write one little-endian length-prefixed frame.
      * @param data Payload bytes. An embedded NUL is preserved.
-     * @param timeout Maximum wait for the peer to accept every byte.
-     * @return Result with the payload on success, or errno. ETIMEDOUT leaves the descriptor open.
+     * @param timeout Maximum wait for the peer to accept every byte. Checked before each write.
+     * @return Result with the payload on success, or errno. If any byte of the frame was sent and the frame was not finished, that errno sticks and later calls transfer nothing. EMSGSIZE sticks. The descriptor stays open.
      */
     Result writeData(const std::string& data, std::chrono::milliseconds timeout);
 
     /**
      * @brief Set the capacity of the internal frame buffer.
-     * @param bufSize Requested capacity in bytes. Zero is ignored. Values above kMaxBuffer are clamped.
+     * @param bufSize Requested capacity in bytes. Zero is ignored. Values above kMaxBuffer are clamped. A size below the bytes already buffered is ignored.
      * @return No value.
      */
     void setInternalBuffer(std::size_t bufSize);
 
 private:
+    Result failSticky(int error);
 
     std::string fifoPath;
     Mode mode;
     int fd;
     bool ownsName;
     int createError;
+    int stickyError;
     std::size_t bufferLimit;
     std::vector<char> buffer;
 };

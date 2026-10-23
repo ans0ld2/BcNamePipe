@@ -6,6 +6,8 @@
 #include <type_traits>
 
 #include <cerrno>
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -276,19 +278,22 @@ int testWriteTimeout()
         int code = 1;
         {
             Bc::BcNamedPipe writer(path, Bc::BcNamedPipe::Mode::Writer);
-            writer.setInternalBuffer(Bc::BcNamedPipe::kMaxBuffer);
+            const std::string bulk(256 * 1024, 'Z');
+            writer.setInternalBuffer(bulk.size() + 4);
             if (writer.open(std::chrono::seconds(2)) != 0) {
                 code = 2;
             } else {
-                const std::string bulk(Bc::BcNamedPipe::kMaxBuffer - 4, 'Z');
                 const auto started = std::chrono::steady_clock::now();
                 const Bc::BcNamedPipe::Result blocked = writer.writeData(bulk, std::chrono::milliseconds(250));
                 const auto elapsed = std::chrono::steady_clock::now() - started;
-                const Bc::BcNamedPipe::Result again = writer.writeData(std::string("x"), std::chrono::milliseconds(50));
+                const auto againStarted = std::chrono::steady_clock::now();
+                const Bc::BcNamedPipe::Result again = writer.writeData(std::string("x"), std::chrono::seconds(2));
+                const auto againElapsed = std::chrono::steady_clock::now() - againStarted;
                 if (blocked.error == ETIMEDOUT
-                    && again.error == ETIMEDOUT
+                    && again.error == blocked.error
                     && elapsed >= std::chrono::milliseconds(200)
-                    && elapsed < std::chrono::seconds(3)) {
+                    && elapsed < std::chrono::seconds(3)
+                    && againElapsed < std::chrono::milliseconds(200)) {
                     code = 0;
                 }
             }
@@ -306,6 +311,286 @@ int testWriteTimeout()
     const int code = childStatus(status);
     if (code != 0) {
         return fail("writeData did not time out while the peer never read: " + std::to_string(code));
+    }
+    return 0;
+}
+
+int testEmptyFrame()
+{
+    const std::string path = "/tmp/bc-named-pipe-empty-" + std::to_string(::getpid());
+    ::unlink(path.c_str());
+
+    Bc::BcNamedPipe reader(path, Bc::BcNamedPipe::Mode::Reader);
+    ::alarm(10);
+    if (reader.open(std::chrono::milliseconds(0)) != 0) {
+        ::alarm(0);
+        return fail("empty-frame reader open failed");
+    }
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        ::alarm(0);
+        return fail("empty-frame fork failed");
+    }
+    if (pid == 0) {
+        ::alarm(5);
+        int code = 1;
+        {
+            Bc::BcNamedPipe writer(path, Bc::BcNamedPipe::Mode::Writer);
+            if (writer.open(std::chrono::seconds(2)) == 0
+                && writer.writeData(std::string(), std::chrono::seconds(2)).error == 0) {
+                code = 0;
+            }
+        }
+        _exit(code);
+    }
+
+    const Bc::BcNamedPipe::Result got = reader.readData(std::chrono::seconds(2));
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) {
+        ::alarm(0);
+        return fail("empty-frame waitpid failed");
+    }
+    ::alarm(0);
+    if (childStatus(status) != 0) {
+        return fail("empty-frame writer failed");
+    }
+    if (got.error != 0 || !got.bytes.empty()) {
+        return fail("empty frame did not round-trip, error " + std::to_string(got.error)
+            + " size " + std::to_string(got.bytes.size()));
+    }
+    return 0;
+}
+
+int testReaderWaitsForWriter()
+{
+    const std::string path = "/tmp/bc-named-pipe-wait-" + std::to_string(::getpid());
+    ::unlink(path.c_str());
+    const std::string payload("late\0writer", 11);
+
+    Bc::BcNamedPipe reader(path, Bc::BcNamedPipe::Mode::Reader);
+    reader.setInternalBuffer(4096);
+    ::alarm(10);
+    if (reader.open(std::chrono::milliseconds(0)) != 0) {
+        ::alarm(0);
+        return fail("wait-for-writer reader open failed");
+    }
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        ::alarm(0);
+        return fail("wait-for-writer fork failed");
+    }
+    if (pid == 0) {
+        ::alarm(5);
+        ::poll(nullptr, 0, 200);
+        int code = 1;
+        {
+            Bc::BcNamedPipe writer(path, Bc::BcNamedPipe::Mode::Writer);
+            writer.setInternalBuffer(4096);
+            if (writer.open(std::chrono::seconds(2)) == 0
+                && writer.writeData(payload, std::chrono::seconds(2)).error == 0) {
+                code = 0;
+            }
+        }
+        _exit(code);
+    }
+
+    const Bc::BcNamedPipe::Result got = reader.readData(std::chrono::seconds(2));
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) {
+        ::alarm(0);
+        return fail("wait-for-writer waitpid failed");
+    }
+    ::alarm(0);
+    if (childStatus(status) != 0) {
+        return fail("wait-for-writer child failed: " + std::to_string(childStatus(status)));
+    }
+    if (got.error != 0 || got.bytes != payload) {
+        return fail("readData did not wait for the late writer, error " + std::to_string(got.error));
+    }
+    return 0;
+}
+
+int testMidFrameEof()
+{
+    const std::string path = "/tmp/bc-named-pipe-mid-" + std::to_string(::getpid());
+    ::unlink(path.c_str());
+
+    Bc::BcNamedPipe reader(path, Bc::BcNamedPipe::Mode::Reader);
+    reader.setInternalBuffer(4096);
+    ::alarm(10);
+    if (reader.open(std::chrono::milliseconds(0)) != 0) {
+        ::alarm(0);
+        return fail("mid-frame reader open failed");
+    }
+
+    const pid_t torn = ::fork();
+    if (torn < 0) {
+        ::alarm(0);
+        return fail("mid-frame fork failed");
+    }
+    if (torn == 0) {
+        ::alarm(5);
+        const int fd = ::open(path.c_str(), O_WRONLY);
+        if (fd < 0) {
+            _exit(2);
+        }
+        const char partial[2] = {0x01, 0x00};
+        const ssize_t n = ::write(fd, partial, 2);
+        ::close(fd);
+        _exit(n == 2 ? 0 : 3);
+    }
+
+    int tornStatus = 0;
+    if (::waitpid(torn, &tornStatus, 0) < 0) {
+        ::alarm(0);
+        return fail("mid-frame waitpid failed");
+    }
+    if (childStatus(tornStatus) != 0) {
+        ::alarm(0);
+        return fail("mid-frame writer failed: " + std::to_string(childStatus(tornStatus)));
+    }
+
+    const auto started = std::chrono::steady_clock::now();
+    const Bc::BcNamedPipe::Result tornRead = reader.readData(std::chrono::seconds(2));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    if (tornRead.error != Bc::BcNamedPipe::kPeerClosed || elapsed >= std::chrono::milliseconds(500)) {
+        ::alarm(0);
+        return fail("mid-frame EOF was not sticky peer close, error " + std::to_string(tornRead.error));
+    }
+
+    const pid_t next = ::fork();
+    if (next < 0) {
+        ::alarm(0);
+        return fail("mid-frame second fork failed");
+    }
+    if (next == 0) {
+        ::alarm(5);
+        int code = 1;
+        {
+            Bc::BcNamedPipe writer(path, Bc::BcNamedPipe::Mode::Writer);
+            writer.setInternalBuffer(4096);
+            if (writer.open(std::chrono::seconds(2)) == 0
+                && writer.writeData(std::string("next"), std::chrono::seconds(2)).error == 0) {
+                code = 0;
+            }
+        }
+        _exit(code);
+    }
+
+    const Bc::BcNamedPipe::Result glued = reader.readData(std::chrono::seconds(1));
+    int nextStatus = 0;
+    ::waitpid(next, &nextStatus, 0);
+    ::alarm(0);
+    if (glued.error != Bc::BcNamedPipe::kPeerClosed || glued.bytes == "next") {
+        return fail("mid-frame EOF was glued to the next frame, error " + std::to_string(glued.error));
+    }
+    return 0;
+}
+
+int testEmsgsizeSticky()
+{
+    const std::string path = "/tmp/bc-named-pipe-big-" + std::to_string(::getpid());
+    ::unlink(path.c_str());
+
+    Bc::BcNamedPipe reader(path, Bc::BcNamedPipe::Mode::Reader);
+    reader.setInternalBuffer(128);
+    ::alarm(10);
+    if (reader.open(std::chrono::milliseconds(0)) != 0) {
+        ::alarm(0);
+        return fail("emsgsize reader open failed");
+    }
+
+    const std::string payload(200, 'A');
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        ::alarm(0);
+        return fail("emsgsize fork failed");
+    }
+    if (pid == 0) {
+        ::alarm(5);
+        int code = 1;
+        {
+            Bc::BcNamedPipe writer(path, Bc::BcNamedPipe::Mode::Writer);
+            writer.setInternalBuffer(payload.size() + 4);
+            if (writer.open(std::chrono::seconds(2)) == 0
+                && writer.writeData(payload, std::chrono::seconds(2)).error == 0) {
+                code = 0;
+            }
+        }
+        _exit(code);
+    }
+
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) {
+        ::alarm(0);
+        return fail("emsgsize waitpid failed");
+    }
+    ::alarm(0);
+    if (childStatus(status) != 0) {
+        return fail("emsgsize writer failed");
+    }
+
+    const Bc::BcNamedPipe::Result first = reader.readData(std::chrono::seconds(2));
+    const Bc::BcNamedPipe::Result second = reader.readData(std::chrono::seconds(2));
+    if (first.error != EMSGSIZE || second.error != EMSGSIZE || !second.bytes.empty()) {
+        return fail("EMSGSIZE was not sticky, first " + std::to_string(first.error)
+            + " second " + std::to_string(second.error));
+    }
+    return 0;
+}
+
+int testLargeConcurrent()
+{
+    const std::string path = "/tmp/bc-named-pipe-large-" + std::to_string(::getpid());
+    ::unlink(path.c_str());
+    const std::size_t payloadSize = 256 * 1024;
+    std::string payload(payloadSize, '\0');
+    for (std::size_t i = 0; i < payload.size(); ++i) {
+        payload[i] = static_cast<char>(i & 0xff);
+    }
+
+    Bc::BcNamedPipe reader(path, Bc::BcNamedPipe::Mode::Reader);
+    reader.setInternalBuffer(payloadSize + 4);
+    ::alarm(15);
+    if (reader.open(std::chrono::milliseconds(0)) != 0) {
+        ::alarm(0);
+        return fail("large reader open failed");
+    }
+
+    const pid_t pid = ::fork();
+    if (pid < 0) {
+        ::alarm(0);
+        return fail("large fork failed");
+    }
+    if (pid == 0) {
+        ::alarm(10);
+        int code = 1;
+        {
+            Bc::BcNamedPipe writer(path, Bc::BcNamedPipe::Mode::Writer);
+            writer.setInternalBuffer(payloadSize + 4);
+            if (writer.open(std::chrono::seconds(2)) == 0
+                && writer.writeData(payload, std::chrono::seconds(5)).error == 0) {
+                code = 0;
+            }
+        }
+        _exit(code);
+    }
+
+    const Bc::BcNamedPipe::Result got = reader.readData(std::chrono::seconds(5));
+    int status = 0;
+    if (::waitpid(pid, &status, 0) < 0) {
+        ::alarm(0);
+        return fail("large waitpid failed");
+    }
+    ::alarm(0);
+    if (childStatus(status) != 0) {
+        return fail("large writer failed: " + std::to_string(childStatus(status)));
+    }
+    if (got.error != 0 || got.bytes != payload) {
+        return fail("256 KiB concurrent round-trip failed, error " + std::to_string(got.error)
+            + " size " + std::to_string(got.bytes.size()));
     }
     return 0;
 }
@@ -329,6 +614,21 @@ int main()
         return rc;
     }
     if (const int rc = testRoundTrip()) {
+        return rc;
+    }
+    if (const int rc = testEmptyFrame()) {
+        return rc;
+    }
+    if (const int rc = testReaderWaitsForWriter()) {
+        return rc;
+    }
+    if (const int rc = testMidFrameEof()) {
+        return rc;
+    }
+    if (const int rc = testEmsgsizeSticky()) {
+        return rc;
+    }
+    if (const int rc = testLargeConcurrent()) {
         return rc;
     }
     std::cout << "ok" << std::endl;

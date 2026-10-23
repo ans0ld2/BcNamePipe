@@ -5,10 +5,9 @@
 #include <string>
 
 #include <cerrno>
-#include <poll.h>
-#include <unistd.h>
 
-// Reader process. Creates the FIFO, reads one frame, prints embedded NULs as \0.
+// Reader process. The first process to construct the pipe creates the name.
+// Reads one frame and prints embedded NULs as \0.
 // Usage: bc_pipe_reader <path>
 
 int main(int argc, char** argv)
@@ -19,7 +18,6 @@ int main(int argc, char** argv)
     }
 
     const std::string path = argv[1];
-    ::unlink(path.c_str());
 
     Bc::BcNamedPipe reader(path, Bc::BcNamedPipe::Mode::Reader);
     reader.setInternalBuffer(4096);
@@ -29,19 +27,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // Until a writer opens the FIFO, read reports EOF. Keep the fd open and
-    // retry until the frame arrives or the deadline passes.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    Bc::BcNamedPipe::Result result{ETIMEDOUT, {}};
-    while (std::chrono::steady_clock::now() < deadline) {
-        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline - std::chrono::steady_clock::now());
-        result = reader.readData(left);
-        if (result.error != Bc::BcNamedPipe::kPeerClosed) {
-            break;
-        }
-        ::poll(nullptr, 0, 20);
-    }
+    const Bc::BcNamedPipe::Result result = reader.readData(std::chrono::seconds(3));
     if (result.error != 0) {
         std::cerr << "read " << result.error << "\n";
         return 1;
