@@ -7,6 +7,9 @@ include(CMakePackageConfigHelpers)
 
 add_library(BcNamedPipe STATIC BcNamedPipe.cpp BcNamedPipe.h)
 
+find_package(Threads REQUIRED)
+target_link_libraries(BcNamedPipe PUBLIC Threads::Threads)
+
 target_include_directories(BcNamedPipe PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
