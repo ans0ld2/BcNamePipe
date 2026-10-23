@@ -1,33 +1,33 @@
 # BcNamedPipe
 
-Контракт одного именованного канала POSIX между одним читателем и одним писателем. Только Linux.
+Contract for one POSIX named pipe between one reader and one writer. Linux only.
 
-## Имя
+## Name
 
-Конструктор сохраняет путь и режим и вызывает `mkfifo` с правами `0600`. Дескриптор он не открывает.
+The constructor stores the path and mode and calls `mkfifo` with mode `0600`. It does not open the descriptor.
 
-Имя создаёт тот экземпляр, у которого `mkfifo` прошёл успешно. Если имя уже занято, `mkfifo` возвращает `EEXIST`: этот экземпляр имя не создавал и не владеет им.
+The instance whose `mkfifo` succeeds creates the name. If the name is already taken, `mkfifo` returns `EEXIST`: that instance did not create the name and does not own it.
 
-Деструктор закрывает дескриптор. `unlink` делает только владелец имени. Чужое имя деструктор не удаляет.
+The destructor closes the descriptor. Only the owner of the name calls `unlink`. The destructor does not remove a name it does not own.
 
-## Кадр
+## Frame
 
-Кадр — это длина `uint32` в порядке little-endian и сразу за ней полезная нагрузка этой длины. Встроенный нулевой байт входит в нагрузку и не обрывает сообщение.
+A frame is a `uint32` length in little-endian order followed by a payload of that length. An embedded NUL is part of the payload and does not end the message.
 
-`readData` копирует байты, пока не соберётся один целый кадр. `writeData` записывает кадр до конца или возвращает ошибку.
+`readData` copies bytes until one full frame is assembled. `writeData` writes the frame to completion or returns an error.
 
-## Стороны
+## Sides
 
-У канала один `Mode::Reader` и один `Mode::Writer`.
+The pipe has one `Mode::Reader` and one `Mode::Writer`.
 
-Несколько писателей смешивают кадры: байты разных писателей попадают в канал вперемешку, и читатель разбирает уже не те сообщения.
+Several writers mix frames: bytes from different writers land in the pipe interleaved, and the reader no longer sees each writer's messages intact.
 
-## Ожидание
+## Waiting
 
-`open`, `readData` и `writeData` принимают таймаут `std::chrono::milliseconds`.
+`open`, `readData`, and `writeData` take a `std::chrono::milliseconds` timeout.
 
-Читатель открывается с `O_RDONLY|O_NONBLOCK` и возвращается сразу. Писатель открывается с `O_WRONLY|O_NONBLOCK` и при `ENXIO` ждёт читателя не дольше таймаута.
+The reader opens with `O_RDONLY|O_NONBLOCK` and returns immediately. The writer opens with `O_WRONLY|O_NONBLOCK` and, on `ENXIO`, waits for a reader no longer than the timeout.
 
-`readData` не ждёт кадр дольше таймаута. `writeData` не ждёт дольше таймаута, пока сосед вычитает канал. По истечении времени вызов возвращает `ETIMEDOUT` и оставляет дескриптор открытым.
+`readData` does not wait for a frame longer than the timeout. `writeData` does not wait longer than the timeout for the peer to drain the pipe. When time runs out, the call returns `ETIMEDOUT` and leaves the descriptor open.
 
-`Result.error == 0` — в `bytes` лежит один кадр. `kPeerClosed` (`-1`) — сосед закрыл канал или чтение получило EOF. Положительное значение — `errno`.
+`Result.error == 0` means `bytes` holds one frame. `kPeerClosed` (`-1`) means the peer closed the pipe or a read hit EOF. A positive value is `errno`.
